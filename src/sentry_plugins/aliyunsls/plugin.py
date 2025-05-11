@@ -2,7 +2,6 @@ import logging
 from collections.abc import MutableMapping
 from typing import Any
 
-from sentry import tagstore
 from sentry.eventstore.models import Event
 from sentry.integrations.base import FeatureDescription, IntegrationFeatures
 from sentry.plugins.bases.data_forwarding import DataForwardingPlugin
@@ -17,45 +16,44 @@ from .client import AliyunSlsApiClient
 
 logger = logging.getLogger(__name__)
 
-SETUP_URL = "https://github.com/getsentry/sentry/blob/master/src/sentry_plugins/splunk/Splunk_Instructions.rst"
+SETUP_URL = "https://www.alibabacloud.com/help/en/log-service"
 
 DESCRIPTION = """
-Send Sentry events to Aliyun SLS.
+Send Sentry events to Aliyun Log Service (SLS).
 """
 
 
 class AliyunSlsPlugin(CorePluginMixin, DataForwardingPlugin):
     """
-    - Turn on HTTP Event Collector by enabling its endpoint. HEC is not enabled by default.
-      - http://dev.splunk.com/view/event-collector/SP-CAAAE7F
-      - Settings > Data Inputs > HTTP Event Collector > Add new
-        - Name: Sentry
-      - You'll be given an HEC token, which is needed to configure Sentry.
-    - On the client that will log to HEC, create a POST request, and set its
-      authentication header or key/value pair to include the HEC token.
-    - POST data to the HEC token receiver.
+    Forward Sentry events to Aliyun Log Service (SLS).
 
-    Note: Managed Splunk Cloud customers can turn on HTTP Event Collector by filing a request ticket with Splunk Support.
-    Note: Managed Splunk Cloud customers can create a HEC token by filing a request ticket with Splunk Support.
+    To configure this plugin, you will need:
+    - Aliyun SLS Endpoint (e.g., `cn-hangzhou.log.aliyuncs.com`)
+    - Aliyun SLS Project name
+    - Aliyun SLS Logstore name
+    - Aliyun AccessKey ID
+    - Aliyun AccessKey Secret
 
-    For more details on the payload: http://dev.splunk.com/view/event-collector/SP-CAAAE6M
+    The plugin will send logs to the specified Project and Logstore.
+    Ensure the AccessKey has sufficient permissions to write logs.
     """
 
-    title = "Splunk"
-    slug = "splunk"
+    title = "Aliyun SLS"
+    slug = "aliyun-sls"
     description = DESCRIPTION
-    conf_key = "splunk"
-    resource_links = [("Splunk Setup Instructions", SETUP_URL)] + CorePluginMixin.resource_links
-    required_field = "instance"
-    project_token: str | None = None
-    project_index: str | None = None
-    project_source: str | None = None
-    project_instance: str | None = None
-    host: str | None = None
+    conf_key = "aliyun_sls"
+    resource_links = [("Aliyun SLS Setup", SETUP_URL)] + CorePluginMixin.resource_links
+    required_field = "endpoint"
+    project_endpoint: str | None = None
+    project_name: str | None = None
+    project_logstore: str | None = None
+    project_access_key_id: str | None = None
+    project_access_key_secret: str | None = None
+
     feature_descriptions = [
         FeatureDescription(
             """
-            Forward Sentry errors and events to Splunk.
+            Forward Sentry errors and events to Aliyun Log Service.
             """,
             IntegrationFeatures.DATA_FORWARDING,
         )
@@ -68,58 +66,69 @@ class AliyunSlsPlugin(CorePluginMixin, DataForwardingPlugin):
     def get_config(self, project, user=None, initial=None, add_additional_fields: bool = False):
         return [
             {
-                "name": "instance",
-                "label": "Instance URL",
-                "type": "url",
-                "required": True,
-                "help": "The HTTP Event Collector endpoint for your Splunk instance.",
-                "placeholder": "e.g. https://input-foo.cloud.splunk.com:8088",
-            },
-            {
-                "name": "index",
-                "label": "Index",
+                "name": "endpoint",
+                "label": "SLS Endpoint",
                 "type": "string",
                 "required": True,
-                "default": "main",
+                "help": "The public endpoint for your Aliyun SLS project (e.g., cn-hangzhou.log.aliyuncs.com).",
+                "placeholder": "e.g. cn-hangzhou.log.aliyuncs.com",
             },
             {
-                "name": "source",
-                "label": "Source",
+                "name": "project",
+                "label": "SLS Project",
                 "type": "string",
                 "required": True,
-                "default": "sentry",
+                "help": "Your Aliyun SLS Project name.",
+            },
+            {
+                "name": "logstore",
+                "label": "SLS Logstore",
+                "type": "string",
+                "required": True,
+                "help": "Your Aliyun SLS Logstore name within the project.",
+            },
+            {
+                "name": "access_key_id",
+                "label": "AccessKey ID",
+                "type": "string",
+                "required": True,
+                "help": "Your Aliyun AccessKey ID.",
             },
             get_secret_field_config(
-                name="token", label="Token", secret=self.get_option("token", project)
+                name="access_key_secret",
+                label="AccessKey Secret",
+                secret=self.get_option("access_key_secret", project),
+                help_text="Your Aliyun AccessKey Secret.",
             ),
+            {
+                "name": "sls_topic",
+                "label": "SLS Topic (Optional)",
+                "type": "string",
+                "required": False,
+                "default": "sentry",
+                "help": "Topic to associate with the logs in Aliyun SLS.",
+            },
+            {
+                "name": "sls_source",
+                "label": "SLS Source (Optional)",
+                "type": "string",
+                "required": False,
+                "help": "Source to associate with the logs. If empty, event's server_name or IP will be used, or 'sentry_server'.",
+            },
         ]
 
-    def get_host_for_splunk(self, event):
-        host = event.get_tag("server_name")
-        if host:
-            return host
-
-        user_interface = event.interfaces.get("user")
-        if user_interface:
-            host = user_interface.ip_address
-            if host:
-                return host
-
-        return None
-
-    def get_event_payload_properties(self, event):
+    def get_event_payload_properties(self, event: Event) -> dict[str, Any]:
         props = {
-            "event_id": event.event_id,
-            "issue_id": event.group_id,
-            "project_id": event.project.slug,
-            "transaction": event.get_tag("transaction") or "",
-            "release": event.get_tag("sentry:release") or "",
-            "environment": event.get_tag("environment") or "",
-            "type": event.get_event_type(),
+            "sentry_event_id": event.event_id,
+            "sentry_issue_id": event.group_id,
+            "sentry_project_slug": event.project.slug,
+            "sentry_transaction": event.get_tag("transaction") or "",
+            "sentry_release": event.get_tag("sentry:release") or "",
+            "sentry_environment": event.get_tag("sentry:environment") or "",
+            "sentry_event_type": event.get_event_type(),
+            **{f"sentry_tag_{k.replace('.', '_')}": v for k, v in event.tags}
         }
-        props["tags"] = [
-            [k.format(tagstore.backend.get_standardized_key(k)), v] for k, v in event.tags
-        ]
+
         for key, value in event.interfaces.items():
             if key == "request":
                 headers = value.headers
@@ -128,90 +137,114 @@ class AliyunSlsPlugin(CorePluginMixin, DataForwardingPlugin):
 
                 props.update(
                     {
-                        "request_url": value.url,
-                        "request_method": value.method,
-                        "request_referer": headers.get("Referer", ""),
+                        "http_url": value.url,
+                        "http_method": value.method,
+                        "http_referer": headers.get("Referer", ""),
                     }
                 )
             elif key == "exception":
-                exc = value.values[0]
-                props.update({"exception_type": exc.type, "exception_value": exc.value})
+                if value.values:
+                    exc = value.values[0]
+                    props.update({"exception_type": exc.type, "exception_value": exc.value})
             elif key == "logentry":
-                props.update({"message": value.formatted or value.message})
+                props.update({"log_message": value.formatted or value.message})
             elif key in ("csp", "expectct", "expectstable", "hpkp"):
                 props.update(
                     {
-                        "{}_{}".format(key.rsplit(".", 1)[-1].lower(), k): v
+                        f"{key.rsplit('.', 1)[-1].lower()}_{k.replace('-', '_')}": v
                         for k, v in value.to_json().items()
                     }
                 )
             elif key == "user":
-                user_payload = {}
+                user_payload: dict[str, Any] = {}
                 if value.id:
                     user_payload["user_id"] = value.id
                 if value.email:
                     user_payload["user_email_hash"] = md5_text(value.email).hexdigest()
                 if value.ip_address:
-                    user_payload["user_ip_trunc"] = anonymize_ip(value.ip_address)
+                    user_payload["user_ip_truncated"] = anonymize_ip(value.ip_address)
                 if user_payload:
                     props.update(user_payload)
         return props
 
-    def initialize_variables(self, event):
-        self.project_token = self.get_option("token", event.project)
-        self.project_index = self.get_option("index", event.project)
-        self.project_instance = self.get_option("instance", event.project)
-        self.host = self.get_host_for_splunk(event)
+    def initialize_variables(self, event: Event) -> None:
+        self.project_endpoint = self.get_option("endpoint", event.project)
+        self.project_name = self.get_option("project", event.project)
+        self.project_logstore = self.get_option("logstore", event.project)
+        self.project_access_key_id = self.get_option("access_key_id", event.project)
+        self.project_access_key_secret = self.get_option("access_key_secret", event.project)
+        self.project_sls_topic = self.get_option("sls_topic", event.project) or "sentry"
 
-        if self.project_instance and not self.project_instance.endswith("/services/collector"):
-            self.project_instance = self.project_instance.rstrip("/") + "/services/collector"
+        default_source = event.get_tag("server_name")
+        if not default_source:
+            user_interface = event.interfaces.get("user")
+            if user_interface and user_interface.ip_address:
+                default_source = user_interface.ip_address
+            else:
+                default_source = "sentry_server"
 
-        self.project_source = self.get_option("source", event.project) or "sentry"
+        self.project_sls_source = self.get_option("sls_source", event.project) or default_source
 
-    def get_rl_key(self, event):
-        return f"{self.conf_key}:{md5_text(self.project_token).hexdigest()}"
+    def get_rl_key(self, event: Event) -> str | None:
+        if not self.project_access_key_id or not self.project_endpoint or not self.project_name:
+            return None
+        return f"{self.conf_key}:{md5_text(self.project_endpoint + self.project_name + self.project_access_key_id).hexdigest()}"
 
-    def is_ratelimited(self, event):
+    def is_ratelimited(self, event: Event) -> bool:
         if super().is_ratelimited(event):
             metrics.incr(
-                "integrations.splunk.forward-event.rate-limited",
+                "integrations.aliyun_sls.forward_event.rate_limited",
                 tags={"event_type": event.get_event_type()},
             )
             return True
         return False
 
-    def get_event_payload(self, event):
+    def get_event_payload(self, event: Event) -> dict[str, Any]:
+        log_item = {
+            "time": int(event.datetime.timestamp()),
+            **self.get_event_payload_properties(event),
+        }
+
         payload = {
-            "time": int(event.datetime.strftime("%s")),
-            "source": self.project_source,
-            "index": self.project_index,
-            "event": self.get_event_payload_properties(event),
+            "__topic__": self.project_sls_topic,
+            "__source__": self.project_sls_source,
+            "__logs__": [log_item],
         }
         return payload
 
     def forward_event(self, event: Event, payload: MutableMapping[str, Any]) -> bool:
-        if not (self.project_token and self.project_index and self.project_instance):
+        if not (
+            self.project_endpoint
+            and self.project_name
+            and self.project_logstore
+            and self.project_access_key_id
+            and self.project_access_key_secret
+        ):
             metrics.incr(
-                "integrations.splunk.forward-event.unconfigured",
+                "integrations.aliyun_sls.forward_event.unconfigured",
                 tags={"event_type": event.get_event_type()},
             )
             return False
 
-        if self.host:
-            payload["host"] = self.host
-
-        client = AliyunSlsApiClient(self.project_instance, self.project_token)
+        client = AliyunSlsApiClient(
+            endpoint=self.project_endpoint,
+            project_name=self.project_name,
+            logstore_name=self.project_logstore,
+            access_key_id=self.project_access_key_id,
+            access_key_secret=self.project_access_key_secret,
+        )
 
         try:
-            # https://docs.splunk.com/Documentation/Splunk/7.2.3/Data/TroubleshootHTTPEventCollector
             client.request(payload)
         except Exception as exc:
-            metric = "integrations.splunk.forward-event.error"
+            metric = "integrations.aliyun_sls.forward_event.error"
             metrics.incr(metric, tags={"event_type": event.get_event_type()})
             logger.info(
                 metric,
                 extra={
-                    "instance": self.project_instance,
+                    "sls_project": self.project_name,
+                    "sls_logstore": self.project_logstore,
+                    "sls_endpoint": self.project_endpoint,
                     "project_id": event.project_id,
                     "organization_id": event.project.organization_id,
                     "error": str(exc),
@@ -219,17 +252,13 @@ class AliyunSlsPlugin(CorePluginMixin, DataForwardingPlugin):
             )
 
             if isinstance(exc, ApiError) and (
-                # These two are already handled by the API client, Just log and return.
                 isinstance(exc, (ApiHostError, ApiTimeoutError))
-                # Most 4xxs are not errors or actionable for us do not re-raise.
-                or (exc.code is not None and (401 <= exc.code <= 404))
-                # 502s are too noisy.
-                or exc.code == 502
             ):
                 return False
             raise
 
         metrics.incr(
-            "integrations.splunk.forward-event.success", tags={"event_type": event.get_event_type()}
+            "integrations.aliyun_sls.forward_event.success",
+            tags={"event_type": event.get_event_type()}
         )
         return True
